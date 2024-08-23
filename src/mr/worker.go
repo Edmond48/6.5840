@@ -35,7 +35,11 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
-
+	var id int
+	ok := call("Coordinator.RegisterWorker", Empty{}, &id)
+	if ok {
+		log.Printf("W%v:registered successfully", id)
+	}
 }
 
 //

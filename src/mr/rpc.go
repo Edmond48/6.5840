@@ -23,7 +23,27 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskType int
+const (
+	MAP TaskType 	= iota
+	REDUCE TaskType = iota
+	QUIT TaskType	= iota
+)
+func (tt TaskType) String() string {
+	switch tt {
+	case MAP:		return "MAP"
+	case REDUCE:	return "REDUCE"
+	case QUIT:		return "QUIT"
+	default:		return "Unknown"
+	}
+}
 
+type Empty struct {}
+
+type Task struct {
+	ttype TaskType
+	input []string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
