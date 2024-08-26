@@ -4,6 +4,11 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
+import "encoding/json"
+import "io/ioutil"
+import "strconv"
+import "time"
+import "os"
 
 
 //
@@ -35,10 +40,73 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
-	var id int
-	ok := call("Coordinator.RegisterWorker", Empty{}, &id)
-	if ok {
-		log.Printf("W%v:registered successfully", id)
+	for {
+		task := Task{}
+		log.Printf("W:requesting work")
+		ok := call("Coordinator.RequestTask", Empty{}, &task)
+		if ok {
+			log.Printf("W:received work %v", task)
+		} else {
+			log.Printf("W:Failed to request work")
+			time.Sleep(time.Second)
+			continue
+		}
+		
+		switch task.Ttype {
+		case MAP:
+			// perform map
+			filename := task.Input[0]
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Fatalf("W:cannot open %v", filename)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("W:cannot read %v", filename)
+			}
+			file.Close()
+			kva := mapf(filename, string(content))
+
+			// write results
+			nReduce, err := strconv.Atoi(task.Input[1])
+			if err != nil {
+				log.Fatalf("Could not convert nReduce string \"%v\"", task.Input[1])
+			}
+ 			tmpFiles := make([]*os.File, nReduce)
+			encoders := make([]*json.Encoder, nReduce)
+			for i := 0; i < nReduce; i++ {
+				tmpFile, err := ioutil.TempFile("", "mr-map-tmp-*")
+				if err != nil {
+					log.Fatalf("W:cannot open temp file")
+				}
+				tmpFiles[i] = tmpFile
+				encoders[i] = json.NewEncoder(tmpFile)
+			}
+			for _, kv := range kva {
+				enc := encoders[ihash(kv.Key) % nReduce]
+				if err := enc.Encode(&kv); err != nil {
+					log.Fatalf("W:Failed to write %v", kv)
+				} 
+			}
+			response := Task{task.Id, task.Ttype, make([]string, nReduce)}
+			for i := 0; i < nReduce; i++ {
+				if err := tmpFiles[i].Close(); err != nil {
+					log.Fatalf("W:Failed to close %v", tmpFiles[i].Name)
+				}
+				intermediateFileName := fmt.Sprintf("mr-%v-%v", task.Id, i)
+				if err := os.Rename(tmpFiles[i].Name(), intermediateFileName); err != nil {
+					log.Fatalf("W:Failed to rename file %v", tmpFiles[i].Name())
+				}
+				response.Input[i] = intermediateFileName
+			}
+			ok = call("Coordinator.DoneTask", &response, &Empty{})
+			if ok {
+				log.Printf("W:completed task %v", task)
+			} else {
+				log.Printf("W:failed to inform coordinator")
+				return
+			}
+		}
 	}
 }
 

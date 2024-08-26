@@ -6,8 +6,11 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"fmt"
+)
 
 //
 // example to show how to declare the arguments
@@ -41,10 +44,14 @@ func (tt TaskType) String() string {
 type Empty struct {}
 
 type Task struct {
-	ttype TaskType
-	input []string
+	Id		int
+	Ttype	TaskType
+	Input	[]string
 }
-
+func (t Task) String() string {
+	return fmt.Sprintf("{id:%v,type:%v,args:%v}", t.Id, t.Ttype, t.Input)
+}
+ 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since
