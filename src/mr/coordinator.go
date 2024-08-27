@@ -17,6 +17,7 @@ type Coordinator struct {
 	mapResults [][]string
 	mu sync.Mutex
 	done sync.WaitGroup
+	jobDone bool
 }
 
 // RPC handlers for the worker to call.
@@ -30,12 +31,16 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 func (c *Coordinator) RequestTask(args Empty, reply *Task) error {
-	task := <- c.taskQueue
+	task, ok := <- c.taskQueue
+	if !ok {
+		reply.Ttype = QUIT
+		return nil
+	}
 	reply.Id = task.Id
 	reply.Ttype = task.Ttype
 	reply.Input = task.Input
 
-	defer c.startWait(task.Id, task)
+	defer c.startWait(task)
 
 	c.mu.Lock()
 	c.waiting[task.Id] = true
@@ -55,18 +60,18 @@ func (c *Coordinator) DoneTask(task *Task, reply *Empty) error {
 	}
 	c.mu.Unlock()
 
-	c.done.Done()
+	defer c.done.Done()
 	return nil
 }
 
 
 // wait for 10 seconds, then resend the task to channel
-func (c *Coordinator) startWait(id int, task Task) {
+func (c *Coordinator) startWait(task Task) {
 	go func() {
 		time.Sleep(10 * time.Second)
 		c.mu.Lock()
-		if c.waiting[id] {
-			log.Printf("CDNT:Task id:%v failed, re-issue task", id)
+		if c.waiting[task.Id] {
+			log.Printf("CDNT:Task failed %v, re-issue task", task)
 			go func() { c.taskQueue <- task }()
 		}
 		c.mu.Unlock()
@@ -75,25 +80,28 @@ func (c *Coordinator) startWait(id int, task Task) {
 
 func (c *Coordinator) runJob(files []string, nReduce int) {
 	for id, file := range files {
-		go func(file string) {
+		c.done.Add(1)
+		go func(id int, file string) {
 			task := Task{id, MAP, []string{file, strconv.Itoa(nReduce)}}
 			log.Printf("CDNT:Send task %v to queue", task)
 			c.taskQueue <- task
-		}(file)
-		c.done.Add(1)
+		}(id, file)
 	}
 	c.done.Wait()
 	log.Printf("CDNT:Map phase done")
 	for id, reduceFiles := range c.mapResults {
-		go func(files []string) {
-			task := Task{id, REDUCE, reduceFiles}
+		c.done.Add(1)
+		go func(id int, files []string) {
+			task := Task{id, REDUCE, files}
 			log.Printf("CDNT:Send task %v to queue", task)
 			c.taskQueue <- task
-		}(reduceFiles)
-		c.done.Add(1)
+		}(id+len(files), reduceFiles)
 	}
 	c.done.Wait()
 	log.Printf("CDNT:Reduce phase done")
+
+	close(c.taskQueue)
+	c.jobDone = true
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -113,10 +121,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-	// Your code here.
-
-	return ret
+	return c.jobDone
 }
 
 // create a Coordinator.
@@ -127,11 +132,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		taskQueue: make(chan Task),
 		waiting: make([]bool, len(files) + nReduce),
 		mapResults: make([][]string, nReduce),
+		jobDone: false,
 	}
 
 	// Your code here.
 	defer c.runJob(files, nReduce)
 
 	c.server()
+	log.Println("CDNT:Started")
 	return &c
 }

@@ -7,8 +7,8 @@ import "hash/fnv"
 import "encoding/json"
 import "io/ioutil"
 import "strconv"
-import "time"
 import "os"
+import "sort"
 
 
 //
@@ -18,6 +18,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -42,70 +50,23 @@ func Worker(mapf func(string, string) []KeyValue,
 	// CallExample()
 	for {
 		task := Task{}
-		log.Printf("W:requesting work")
+		log.Printf("W:Requesting work")
 		ok := call("Coordinator.RequestTask", Empty{}, &task)
 		if ok {
-			log.Printf("W:received work %v", task)
+			log.Printf("W:Received work %v", task)
 		} else {
 			log.Printf("W:Failed to request work")
-			time.Sleep(time.Second)
-			continue
+			break
 		}
 		
 		switch task.Ttype {
 		case MAP:
-			// perform map
-			filename := task.Input[0]
-			file, err := os.Open(filename)
-			if err != nil {
-				log.Fatalf("W:cannot open %v", filename)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("W:cannot read %v", filename)
-			}
-			file.Close()
-			kva := mapf(filename, string(content))
-
-			// write results
-			nReduce, err := strconv.Atoi(task.Input[1])
-			if err != nil {
-				log.Fatalf("Could not convert nReduce string \"%v\"", task.Input[1])
-			}
- 			tmpFiles := make([]*os.File, nReduce)
-			encoders := make([]*json.Encoder, nReduce)
-			for i := 0; i < nReduce; i++ {
-				tmpFile, err := ioutil.TempFile("", "mr-map-tmp-*")
-				if err != nil {
-					log.Fatalf("W:cannot open temp file")
-				}
-				tmpFiles[i] = tmpFile
-				encoders[i] = json.NewEncoder(tmpFile)
-			}
-			for _, kv := range kva {
-				enc := encoders[ihash(kv.Key) % nReduce]
-				if err := enc.Encode(&kv); err != nil {
-					log.Fatalf("W:Failed to write %v", kv)
-				} 
-			}
-			response := Task{task.Id, task.Ttype, make([]string, nReduce)}
-			for i := 0; i < nReduce; i++ {
-				if err := tmpFiles[i].Close(); err != nil {
-					log.Fatalf("W:Failed to close %v", tmpFiles[i].Name)
-				}
-				intermediateFileName := fmt.Sprintf("mr-%v-%v", task.Id, i)
-				if err := os.Rename(tmpFiles[i].Name(), intermediateFileName); err != nil {
-					log.Fatalf("W:Failed to rename file %v", tmpFiles[i].Name())
-				}
-				response.Input[i] = intermediateFileName
-			}
-			ok = call("Coordinator.DoneTask", &response, &Empty{})
-			if ok {
-				log.Printf("W:completed task %v", task)
-			} else {
-				log.Printf("W:failed to inform coordinator")
-				return
-			}
+			HandleMap(&mapf, &task)
+		case REDUCE:
+			HandleReduce(&reducef, &task)
+		case QUIT:
+			log.Printf("W:Exiting")
+			return
 		}
 	}
 }
@@ -136,6 +97,115 @@ func CallExample() {
 		fmt.Printf("reply.Y %v\n", reply.Y)
 	} else {
 		fmt.Printf("call failed!\n")
+	}
+}
+
+func HandleMap(mapf *func(string, string) []KeyValue, task *Task) {
+	// perform map
+	filename := task.Input[0]
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("W:Cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("W:Cannot read %v", filename)
+	}
+	file.Close()
+	kva := (*mapf)(filename, string(content))
+
+	// write results
+	nReduce, err := strconv.Atoi(task.Input[1])
+	if err != nil {
+		log.Fatalf("Could not convert nReduce string \"%v\"", task.Input[1])
+	}
+	tmpFiles := make([]*os.File, nReduce)
+	encoders := make([]*json.Encoder, nReduce)
+	for i := 0; i < nReduce; i++ {
+		tmpFile, err := ioutil.TempFile("", "mr-map-tmp-*")
+		if err != nil {
+			log.Fatalf("W:Cannot open temp file")
+		}
+		tmpFiles[i] = tmpFile
+		encoders[i] = json.NewEncoder(tmpFile)
+	}
+	for _, kv := range kva {
+		enc := encoders[ihash(kv.Key) % nReduce]
+		if err := enc.Encode(&kv); err != nil {
+			log.Fatalf("W:Failed to write %v", kv)
+		} 
+	}
+	response := Task{task.Id, task.Ttype, make([]string, nReduce)}
+	for i := 0; i < nReduce; i++ {
+		if err := tmpFiles[i].Close(); err != nil {
+			log.Fatalf("W:Failed to close %v", tmpFiles[i].Name)
+		}
+		intermediateFileName := fmt.Sprintf("mr-%v-%v", task.Id, i)
+		if err := os.Rename(tmpFiles[i].Name(), intermediateFileName); err != nil {
+			log.Fatalf("W:Failed to rename file %v", tmpFiles[i].Name())
+		}
+		response.Input[i] = intermediateFileName
+	}
+	// call done
+	defer callDoneTask(&response, &Empty{})
+}
+
+func HandleReduce(reducef *func(string, []string) string, task *Task) {
+	kva := make([]KeyValue, 0, 16)
+	for _, filename := range task.Input {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("W:Cannot open %v", filename)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		if err := file.Close(); err != nil {
+			log.Fatalf("W:Cannot close file %v", filename)
+		}
+	}
+	
+	sort.Sort(ByKey(kva))
+	
+	oname := fmt.Sprintf("mr-out-%v", task.Id)
+	ofile, _ := os.Create(oname)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := (*reducef)(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+	if err := ofile.Close(); err != nil {
+		log.Fatalf("W:Cannot close %v", oname)
+	}
+
+	// call done
+	defer callDoneTask(task, &Empty{})
+}
+
+func callDoneTask(task *Task, reply *Empty) {
+	ok := call("Coordinator.DoneTask", task, &Empty{})
+	if ok {
+		log.Printf("W:Completed task %v", task)
+	} else {
+		log.Printf("W:Failed to inform completion %v", task)
 	}
 }
 
